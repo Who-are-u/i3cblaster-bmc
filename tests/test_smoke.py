@@ -1,5 +1,5 @@
 """
-Smoke tests for Janus_OCPagent.
+Smoke tests for i3cblaster-bmc.
 
 These do NOT require hardware; they only verify that the modules import and
 that basic pure-Python helpers behave as expected.
@@ -13,20 +13,21 @@ import sys
 
 
 def test_import_agent():
-    mod = importlib.import_module("janus_ocpagent.agent")
+    mod = importlib.import_module("i3cblaster_bmc")
     assert hasattr(mod, "OcpRecoveryAgent")
     assert hasattr(mod, "Reg")
 
 
 def test_env_port(monkeypatch):
-    monkeypatch.setenv("I3C_BLASTER_PORT", "COM42")
-    sys.modules.pop("janus_ocpagent.agent", None)
-    mod = importlib.import_module("janus_ocpagent.agent")
-    assert mod.FORCED_PORT == "COM42"
+    monkeypatch.setenv("I3C_BLASTER_UART", "COM42")
+    sys.modules.pop("i3cblaster_bmc", None)
+    mod = importlib.import_module("i3cblaster_bmc")
+    args = mod.build_arg_parser().parse_args([])
+    assert args.uart == "COM42"
 
 
 def test_le_helpers():
-    mod = importlib.import_module("janus_ocpagent.agent")
+    mod = importlib.import_module("i3cblaster_bmc")
     agent_cls = mod.OcpRecoveryAgent
     assert agent_cls._to_le_bytes(0x11223344, 4) == [0x44, 0x33, 0x22, 0x11]
     assert agent_cls._u32_le([0x44, 0x33, 0x22, 0x11]) == 0x11223344

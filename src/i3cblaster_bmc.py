@@ -27,13 +27,15 @@ IMPORTANT
 """
 
 import argparse
+import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 
 # Load the i3cblaster module from the I3CBlaster git submodule.
-# This module lives in src/janus_ocpagent/, so the repo root is three levels up.
+# This module lives in src/i3cblaster_bmc/, so the repo root is three levels up.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SUBMODULE_PY = os.path.join(_REPO_ROOT, "I3CBlaster", "python")
 if _SUBMODULE_PY not in sys.path:
@@ -42,13 +44,17 @@ if _SUBMODULE_PY not in sys.path:
 import i3cblaster
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
 
-# I3C Blaster COM port. Loaded from the I3C_BLASTER_PORT environment variable.
-# Leave unset (or empty) to auto-detect by USB VID/PID (0x2E8A:0x000A).
-FORCED_PORT = os.environ.get("I3C_BLASTER_PORT") or None
+# I3C Blaster UART/COM port used by the runtime wrapper.
+# It is resolved in build_arg_parser()/main with this priority:
+#   CLI (--uart) > environment (I3C_BLASTER_UART) > .env > auto-detect.
+FORCED_PORT = None
 I3C_CLK_KHZ = 12500           # I3C clock (kHz)
 
 # If you already know the recovery device's dynamic address, set it here to
@@ -62,6 +68,55 @@ FIRMWARE_PATH = "firmware.bin"
 # Streaming chunk size (bytes) written per INDIRECT_FIFO_DATA transfer.
 # Keep modest to stay within a single I3C private write; tune to the device.
 CHUNK_SIZE = 64
+
+
+def _load_dotenv_into_env() -> None:
+    """Load .env entries into process env only for missing keys."""
+    candidates = []
+    env_override = os.environ.get("I3C_BLASTER_DOTENV", "").strip()
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(Path(__file__).resolve().parents[2] / ".env")
+
+    seen: set[Path] = set()
+    for dotenv_path in candidates:
+        if dotenv_path in seen:
+            continue
+        seen.add(dotenv_path)
+        if not dotenv_path.exists():
+            continue
+        for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        return
+
+
+def _resolve_default_uart() -> str | None:
+    uart = os.environ.get("I3C_BLASTER_UART")
+    if uart:
+        return uart
+    _load_dotenv_into_env()
+    return os.environ.get("I3C_BLASTER_UART")
+
+
+def _resolve_default_log_level() -> str:
+    level = os.environ.get("I3C_BLASTER_LOG_LEVEL")
+    if level:
+        return level.upper()
+    _load_dotenv_into_env()
+    return str(os.environ.get("I3C_BLASTER_LOG_LEVEL", "INFO")).upper()
+
+
+def _setup_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(level=level, format="%(levelname)s %(message)s")
 
 
 # ----------------------------------------------------------------------------
@@ -146,24 +201,32 @@ class OcpRecoveryAgent:
 
     def read_prot_cap(self):
         data = self.read_reg(Reg.PROT_CAP, 15)
-        print("PROT_CAP:", [hex(b) for b in data])
+        LOGGER.debug("PROT_CAP: %s", [hex(b) for b in data])
         return data
 
     def read_device_id(self):
         data = self.read_reg(Reg.DEVICE_ID, 24)
-        print("DEVICE_ID:", [hex(b) for b in data])
+        LOGGER.debug("DEVICE_ID: %s", [hex(b) for b in data])
         return data
 
     def read_device_status(self):
         data = self.read_reg(Reg.DEVICE_STATUS, 4)
         state = data[0] if data else None
-        print("DEVICE_STATUS:", [hex(b) for b in data], "state=", hex(state) if state is not None else None)
+        LOGGER.debug(
+            "DEVICE_STATUS: %s state=%s",
+            [hex(b) for b in data],
+            hex(state) if state is not None else None,
+        )
         return data
 
     def read_recovery_status(self):
         data = self.read_reg(Reg.RECOVERY_STATUS, 2)
         st = (data[0] & RECOVERY_STATUS_MASK) if data else None
-        print("RECOVERY_STATUS:", [hex(b) for b in data], "->", hex(st) if st is not None else None)
+        LOGGER.debug(
+            "RECOVERY_STATUS: %s -> %s",
+            [hex(b) for b in data],
+            hex(st) if st is not None else None,
+        )
         return st
 
     def wait_recovery_mode(self, timeout_s=5.0):
@@ -172,10 +235,10 @@ class OcpRecoveryAgent:
         while time.time() - t0 < timeout_s:
             data = self.read_device_status()
             if data and data[0] == DEV_STATUS_RECOVERY_MODE:
-                print("Device is in recovery mode (awaiting image).")
+                LOGGER.info("Device is in recovery mode (awaiting image).")
                 return True
             time.sleep(0.1)
-        print("WARNING: device did not enter recovery mode within timeout.")
+        LOGGER.warning("Device did not enter recovery mode within timeout.")
         return False
 
     def configure_fifo(self, image_size_bytes):
@@ -191,7 +254,7 @@ class OcpRecoveryAgent:
         size_le = self._to_le_bytes(image_size_bytes, 4)
         payload = [0x01, 0x00] + size_le  # [reset=1, cms=0, size...]
         self.write_reg(Reg.INDIRECT_FIFO_CTRL, payload)
-        print(f"INDIRECT_FIFO_CTRL programmed, image_size={image_size_bytes} bytes")
+        LOGGER.info("INDIRECT_FIFO_CTRL programmed, image_size=%d bytes", image_size_bytes)
 
     def fifo_free_space(self):
         """
@@ -211,21 +274,27 @@ class OcpRecoveryAgent:
         # Common RECOVERY_CTRL layout: [component, image_source, activate]
         # Here: component 0, use indirect FIFO (source=1), do not activate yet.
         self.write_reg(Reg.RECOVERY_CTRL, [0x00, 0x01, 0x00])
-        print("RECOVERY_CTRL: recovery started (indirect FIFO source).")
+        LOGGER.info("RECOVERY_CTRL: recovery started (indirect FIFO source).")
 
     def activate_image(self):
         """Tell the device the full image was delivered; activate/boot it."""
         self.write_reg(Reg.RECOVERY_CTRL, [0x00, 0x01, RECOVERY_CTRL_ACTIVATE])
-        print("RECOVERY_CTRL: activate requested.")
+        LOGGER.info("RECOVERY_CTRL: activate requested.")
 
     def stream_firmware(self, image, chunk_size=CHUNK_SIZE):
         """Stream the firmware image into INDIRECT_FIFO_DATA in chunks."""
         total = len(image)
         sent = 0
-        print(f"Streaming {total} bytes in chunks of {chunk_size} ...")
+        LOGGER.info("Streaming %d bytes in chunks of %d ...", total, chunk_size)
         while sent < total:
             # Simple flow control: check FIFO status before writing.
             flags, free, raw = self.fifo_free_space()
+            LOGGER.debug(
+                "FIFO status flags=0x%02x free=%s raw=%s",
+                flags,
+                free,
+                [hex(b) for b in raw] if raw else [],
+            )
             # If we can read a meaningful free-space value, respect it.
             if free is not None and free == 0:
                 # FIFO full; wait a moment and retry.
@@ -236,18 +305,18 @@ class OcpRecoveryAgent:
             self.write_reg(Reg.INDIRECT_FIFO_DATA, chunk)
             sent += len(chunk)
             if (sent // chunk_size) % 16 == 0 or sent == total:
-                print(f"  {sent}/{total} bytes sent")
-        print("Firmware streaming complete.")
+                LOGGER.debug("Stream progress: %d/%d bytes sent", sent, total)
+        LOGGER.info("Firmware streaming complete.")
 
     def wait_recovery_complete(self, timeout_s=30.0):
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             st = self.read_recovery_status()
             if st == RECOVERY_STATUS_SUCCESS:
-                print("Recovery SUCCESS.")
+                LOGGER.info("Recovery SUCCESS.")
                 return True
             time.sleep(0.2)
-        print("WARNING: recovery did not report success within timeout.")
+        LOGGER.warning("Recovery did not report success within timeout.")
         return False
 
 
@@ -264,36 +333,39 @@ def discover_device(i3c):
       3. assign one via ENTDAA
     """
     if RECOVERY_ADDR is not None:
-        print(f"Using configured recovery address 0x{RECOVERY_ADDR:02x}")
+        LOGGER.info("Using configured recovery address 0x%02x", RECOVERY_ADDR)
         return RECOVERY_ADDR
 
     # Clear stale dynamic addresses first.
     try:
         i3c.i3c_rstdaa()
     except Exception as e:
-        print("i3c_rstdaa warning:", e)
+        LOGGER.warning("i3c_rstdaa warning: %s", e)
 
     # Try assigning a dynamic address via ENTDAA.
     try:
         info = i3c.i3c_entdaa(ENTDAA_ASSIGN_ADDR)
         if info is not None:
-            print(f"ENTDAA assigned 0x{ENTDAA_ASSIGN_ADDR:02x}, "
-                  f"device info: {[hex(x) for x in info]}")
+            LOGGER.info(
+                "ENTDAA assigned 0x%02x, device info: %s",
+                ENTDAA_ASSIGN_ADDR,
+                [hex(x) for x in info],
+            )
             return ENTDAA_ASSIGN_ADDR
         else:
-            print("ENTDAA: no device responded (0x7E NAKed).")
+            LOGGER.warning("ENTDAA: no device responded (0x7E NAKed).")
     except Exception as e:
-        print("i3c_entdaa warning:", e)
+        LOGGER.warning("i3c_entdaa warning: %s", e)
 
     # Fall back to scanning.
     try:
         targets = i3c.i3c_scan()
         targets = [t for t in targets if t != 0x7E]
-        print("i3c_scan found:", [hex(t) for t in targets])
+        LOGGER.info("i3c_scan found: %s", [hex(t) for t in targets])
         if targets:
             return targets[0]
     except Exception as e:
-        print("i3c_scan warning:", e)
+        LOGGER.warning("i3c_scan warning: %s", e)
 
     return None
 
@@ -310,7 +382,7 @@ def _auto_int(value):
 def build_arg_parser():
     """Build the argparse parser for the OCP Recovery agent CLI."""
     parser = argparse.ArgumentParser(
-        prog="janus-ocpagent",
+        prog="i3cblaster-bmc",
         description=(
             "Stream a firmware binary blob into an OCP Recovery device "
             "(e.g. Caliptra) over I3C using the I3CBlaster USB-to-I3C converter."
@@ -328,12 +400,13 @@ def build_arg_parser():
         ),
     )
     parser.add_argument(
+        "--uart",
         "--port",
-        default=FORCED_PORT,
+        default=_resolve_default_uart(),
         help=(
             "I3CBlaster serial/COM port (e.g. COM5 or /dev/ttyACM0). "
-            "Defaults to the I3C_BLASTER_PORT environment variable, else "
-            "auto-detect by USB VID:PID."
+            "Defaults to I3C_BLASTER_UART (loads from .env if missing), "
+            "else auto-detect by USB VID:PID."
         ),
     )
     parser.add_argument(
@@ -364,6 +437,23 @@ def build_arg_parser():
         help="Bytes per INDIRECT_FIFO_DATA write (default: %(default)s).",
     )
     parser.add_argument(
+        "--log-level",
+        default=_resolve_default_log_level(),
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        type=lambda s: s.upper(),
+        help=(
+            "Logging level. Defaults to I3C_BLASTER_LOG_LEVEL "
+            "(loads from .env if missing), else INFO."
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_const",
+        const="DEBUG",
+        dest="log_level",
+        help="Shortcut for --log-level DEBUG.",
+    )
+    parser.add_argument(
         "--no-activate",
         action="store_true",
         help="Stream the image but skip the final activate/boot step.",
@@ -377,11 +467,13 @@ def build_arg_parser():
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+    _setup_logging(args.log_level)
+    LOGGER.debug("Runtime arguments: %s", args)
 
     # Apply CLI selections to the runtime configuration used by the wrapper
     # and discovery helpers (which reference the module-level globals).
     global FORCED_PORT, RECOVERY_ADDR, ENTDAA_ASSIGN_ADDR
-    FORCED_PORT = args.port
+    FORCED_PORT = args.uart
     RECOVERY_ADDR = args.addr
     ENTDAA_ASSIGN_ADDR = args.entdaa_addr
 
@@ -389,37 +481,39 @@ def main(argv=None):
     i3c.init()
 
     if not i3c._connect():
-        print("ERROR: could not connect to I3CBlaster. "
-              "Check COM port / firmware / that no terminal holds the port.")
+        LOGGER.error(
+            "Could not connect to I3CBlaster. Check COM port / firmware / "
+            "that no terminal holds the port."
+        )
         return 1
 
-    print("Connected to I3CBlaster.")
+    LOGGER.info("Connected to I3CBlaster.")
 
     try:
         i3c.i3c_clk(args.clk_khz)
-        print(f"I3C clock set to {args.clk_khz} kHz")
+        LOGGER.info("I3C clock set to %d kHz", args.clk_khz)
     except Exception as e:
-        print("i3c_clk warning:", e)
+        LOGGER.warning("i3c_clk warning: %s", e)
 
     addr = discover_device(i3c)
     if addr is None:
-        print("ERROR: no recovery device found on the I3C bus.")
+        LOGGER.error("No recovery device found on the I3C bus.")
         return 1
-    print(f"Recovery device I3C address: 0x{addr:02x}")
+    LOGGER.info("Recovery device I3C address: 0x%02x", addr)
 
     agent = OcpRecoveryAgent(i3c, addr)
 
     # --- OCP Recovery streaming boot sequence ---
-    print("\n=== Reading capabilities / identity ===")
+    LOGGER.info("=== Reading capabilities / identity ===")
     try:
         agent.read_prot_cap()
         agent.read_device_id()
         agent.read_device_status()
     except Exception as e:
-        print("Register read failed (check command codes / device):", e)
+        LOGGER.exception("Register read failed (check command codes / device): %s", e)
         return 1
 
-    print("\n=== Ensure device is in recovery mode ===")
+    LOGGER.info("=== Ensure device is in recovery mode ===")
     agent.wait_recovery_mode(timeout_s=5.0)
 
     # Load firmware image.
@@ -427,28 +521,31 @@ def main(argv=None):
         with open(args.firmware, "rb") as f:
             image = list(f.read())
     except FileNotFoundError:
-        print(f"NOTE: firmware file '{args.firmware}' not found. "
-              "Skipping streaming; register access flow was exercised.")
+        LOGGER.warning(
+            "Firmware file '%s' not found. Skipping streaming; register access "
+            "flow was exercised.",
+            args.firmware,
+        )
         return 0
-    print(f"Loaded firmware '{args.firmware}': {len(image)} bytes")
+    LOGGER.info("Loaded firmware '%s': %d bytes", args.firmware, len(image))
 
-    print("\n=== Start recovery / configure FIFO ===")
+    LOGGER.info("=== Start recovery / configure FIFO ===")
     agent.start_recovery()
     agent.configure_fifo(len(image))
 
-    print("\n=== Stream firmware ===")
+    LOGGER.info("=== Stream firmware ===")
     agent.stream_firmware(image, chunk_size=args.chunk_size)
 
     if args.no_activate:
-        print("\n=== Skipping activate (--no-activate) ===")
+        LOGGER.info("=== Skipping activate (--no-activate) ===")
     else:
-        print("\n=== Activate image ===")
+        LOGGER.info("=== Activate image ===")
         agent.activate_image()
 
-        print("\n=== Wait for recovery to complete ===")
+        LOGGER.info("=== Wait for recovery to complete ===")
         agent.wait_recovery_complete(timeout_s=30.0)
 
-    print("\nDone.")
+    LOGGER.info("Done.")
     return 0
 
 
