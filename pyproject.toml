@@ -1,0 +1,32 @@
+[project]
+name = "janus-ocpagent"
+version = "0.1.0"
+description = "Janus OCP Recovery (streaming boot) agent over I3C, using the I3CBlaster USB-to-I3C converter"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyserial>=3.5",
+]
+
+# The i3cblaster module lives in the I3CBlaster git submodule
+# (I3CBlaster/python/i3cblaster.py) and is loaded at runtime via sys.path,
+# so the submodule stays pristine (no packaging changes required upstream).
+
+[project.scripts]
+janus-ocpagent = "janus_ocpagent.agent:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/janus_ocpagent"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
